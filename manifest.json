@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.yassinesawahi.gamemode",
+  "name": "Game mode",
+  "version": "1.0.0",
+  "author": "Yassine Sawahi",
+  "homepage": "https://github.com/YassineSawahi/omarchy-gamemode",
+  "license": "MIT",
+  "description": "Free RAM before a game: tick which apps, Docker projects and the file indexer to pause, then bring them back one by one or all at once",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Game mode",
+    "description": "Gamepad switch that frees memory for games; lights up while game mode is on",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "schema": []
+  }
+}
