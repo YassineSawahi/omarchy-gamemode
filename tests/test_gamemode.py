@@ -161,6 +161,66 @@ class GameModeTest(unittest.TestCase):
         self.assertEqual(set(started[:2]), {"db", "redis"})
         self.assertEqual(started[2:], ["backend", "nginx"])
 
+    def test_taken_fixed_address_is_reclaimed(self):
+        """Another project started first and took this container's fixed IP."""
+        gm = self.gm
+        calls = []
+
+        class R:
+            def __init__(self, code=0, out="", err=""):
+                self.returncode, self.stdout, self.stderr = code, out, err
+
+        door_started = []
+        nets = {
+            "door": {"NetworkSettings": {"Networks": {"shared": {"IPAMConfig": {"IPv4Address": "192.0.2.2"}}}}},
+            "other": {"NetworkSettings": {"Networks": {"shared": {"IPAMConfig": {}}}}},
+        }
+
+        def fake_run(*cmd, timeout=30):
+            calls.append(cmd[1:])
+            if cmd[1:3] == ("network", "inspect"):
+                return R(out=json.dumps([{"Containers": {"other": {"IPv4Address": "192.0.2.2/29"}}}]))
+            if cmd[1] == "inspect" and cmd[2] in nets:
+                return R(out=json.dumps([nets[cmd[2]]]))
+            if cmd[1] == "start" and cmd[2] == "door":
+                if not door_started and ("network", "disconnect", "shared", "other") not in calls:
+                    return R(1, err="failed to set up container networking: Address already in use")
+                door_started.append(True)
+            return R()
+
+        gm.run = fake_run
+        gm.container_state = lambda cid: ("running", "")
+        self.assertEqual(gm.start_project([{"id": "door", "name": "p-door-1", "service": "door", "depends": []}]), [])
+        order = [c for c in calls if c[:2] in (("network", "disconnect"), ("start", "door"), ("network", "connect"))]
+        self.assertEqual(order, [("start", "door"), ("network", "disconnect", "shared", "other"),
+                                 ("start", "door"), ("network", "connect", "shared", "other")])
+
+    def test_real_clash_is_left_alone(self):
+        """Two containers asking for the same fixed address: nothing is moved."""
+        gm = self.gm
+        calls = []
+
+        class R:
+            def __init__(self, code=0, out="", err=""):
+                self.returncode, self.stdout, self.stderr = code, out, err
+
+        fixed = {"NetworkSettings": {"Networks": {"shared": {"IPAMConfig": {"IPv4Address": "192.0.2.2"}}}}}
+
+        def fake_run(*cmd, timeout=30):
+            calls.append(cmd[1:])
+            if cmd[1:3] == ("network", "inspect"):
+                return R(out=json.dumps([{"Containers": {"other": {"IPv4Address": "192.0.2.2/29"}}}]))
+            if cmd[1] == "inspect":
+                return R(out=json.dumps([fixed]))
+            if cmd[1] == "start":
+                return R(1, err="Address already in use")
+            return R()
+
+        gm.run = fake_run
+        failed = gm.start_project([{"id": "door", "name": "p-door-1", "service": "door", "depends": []}])
+        self.assertEqual(failed, ["p-door-1"])
+        self.assertFalse(any(c[:2] == ("network", "disconnect") for c in calls))
+
     # ------------------------------------------------------------ cli
 
     def test_unknown_command_is_refused(self):

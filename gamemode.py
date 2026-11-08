@@ -392,6 +392,53 @@ def container_state(cid):
     return parts[0], parts[1]
 
 
+def inspect(*args):
+    """First object of `docker <args…>`, e.g. inspect("inspect", id), inspect("network", "inspect", name)."""
+    r = run("docker", *args, timeout=10)
+    if r is None or r.returncode != 0:
+        return {}
+    try:
+        return json.loads(r.stdout)[0]
+    except (ValueError, IndexError):
+        return {}
+
+
+def fixed_ips(cid):
+    """network → address for the networks where this container asks for a fixed IPv4 address."""
+    nets = inspect("inspect", cid).get("NetworkSettings", {}).get("Networks") or {}
+    out = {}
+    for net, conf in nets.items():
+        addr = (conf.get("IPAMConfig") or {}).get("IPv4Address")
+        if addr:
+            out[net] = addr
+    return out
+
+
+def reclaim_ips(c):
+    """Start `c` after moving any container that took one of its fixed addresses without
+    asking for it (Docker hands out dynamic addresses from the same pool). That container
+    is reconnected afterwards and gets another address. Returns whether `c` started."""
+    moved = []
+    for net, addr in fixed_ips(c["id"]).items():
+        for cid, info in (inspect("network", "inspect", net).get("Containers") or {}).items():
+            if info.get("IPv4Address", "").split("/")[0] != addr or cid == c["id"]:
+                continue
+            if fixed_ips(cid).get(net):
+                continue  # it asked for that address too: a real clash, leave it
+            r = run("docker", "network", "disconnect", net, cid, timeout=30)
+            if r is not None and r.returncode == 0:
+                moved.append((net, cid))
+    if not moved:
+        return False
+    r = run("docker", "start", c["id"], timeout=60)
+    for net, cid in moved:
+        run("docker", "network", "connect", net, cid, timeout=30)
+    ok = r is not None and r.returncode == 0
+    log(f"{c['name']}: its fixed address was taken; moved {len(moved)} container(s) aside, "
+        + ("started" if ok else "still failed"))
+    return ok
+
+
 def start_project(cs):
     """Start one compose project, dependencies first, each batch waiting for its
     healthchecks the way `docker compose up` would. Returns names that failed."""
@@ -406,8 +453,12 @@ def start_project(cs):
         for c in batch:
             r = run("docker", "start", c["id"], timeout=60)
             if r is None or r.returncode != 0:
+                err = r.stderr.strip() if r else "timed out"
+                # Another project, started in parallel, may have taken this one's fixed IP.
+                if "address already in use" in err.lower() and reclaim_ips(c):
+                    continue
                 failed.append(c["name"])
-                log(f"docker start {c['name']}: {r.stderr.strip() if r else 'timed out'}")
+                log(f"docker start {c['name']}: {err}")
         deadline = time.time() + HEALTH_WAIT
         waiting = [c for c in batch if c["name"] not in failed]
         while waiting and time.time() < deadline:
