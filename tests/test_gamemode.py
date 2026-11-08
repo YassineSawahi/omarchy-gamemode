@@ -221,6 +221,39 @@ class GameModeTest(unittest.TestCase):
         self.assertEqual(failed, ["p-door-1"])
         self.assertFalse(any(c[:2] == ("network", "disconnect") for c in calls))
 
+    # ------------------------------------------------------------ gpu
+
+    def test_nvidia_report(self):
+        xml = """<?xml version="1.0" ?><nvidia_smi_log><gpu id="00000000:01:00.0">
+          <fb_memory_usage><total>8188 MiB</total><used>1670 MiB</used></fb_memory_usage>
+          <processes>
+            <process_info><pid>20</pid><type>C+G</type><used_memory>283 MiB</used_memory></process_info>
+            <process_info><pid>21</pid><type>G</type><used_memory>40 MiB</used_memory></process_info>
+            <process_info><pid>junk</pid><used_memory>9 MiB</used_memory></process_info>
+          </processes></gpu></nvidia_smi_log>"""
+        self.assertEqual(self.gm.parse_nvidia(xml), ({20: 283, 21: 40}, 1670, 8188))
+        self.assertIsNone(self.gm.parse_nvidia("not xml"))
+
+    def test_fdinfo(self):
+        amd = "pos:\t0\nflags:\t02100002\ndrm-driver:\tamdgpu\ndrm-client-id:\t42\ndrm-memory-vram:\t524288 KiB\n"
+        self.assertEqual(self.gm.parse_fdinfo(amd), ("42", 524288))
+        xe = "drm-driver:\txe\ndrm-client-id:\t7\ndrm-total-local0:\t64 MiB\ndrm-resident-local0:\t32 MiB\n"
+        self.assertEqual(self.gm.parse_fdinfo(xe), ("7", 32 * 1024))
+        self.assertIsNone(self.gm.parse_fdinfo("pos:\t0\nflags:\t0100002\n"))
+
+    def test_gpu_process_in_a_container(self):
+        cid = "a" * 64
+        self.assertEqual(self.gm.docker_id(f"0::/system.slice/docker-{cid}.scope\n"), cid)
+        self.assertEqual(self.gm.docker_id(f"0::/docker/{cid}\n"), cid)
+        self.assertIsNone(self.gm.docker_id("0::/user.slice/user-1000.slice/app.slice/app-chrome.scope\n"))
+
+    def test_rows_show_vram(self):
+        app = {"kind": "app", "mb": 4915, "vram": 283}
+        self.assertEqual(self.gm.describe(app, False), "4.8 GB RAM · 283 MB VRAM · quits, reopens after")
+        box = {"kind": "docker", "mb": 2150, "vram": 3072, "containers": [{}, {}]}
+        self.assertEqual(self.gm.describe(box, False), "2 containers · 2.1 GB RAM · 3.0 GB VRAM")
+        self.assertEqual(self.gm.describe({"kind": "app", "mb": 300, "vram": 0}, False), "0.3 GB RAM · quits, reopens after")
+
     # ------------------------------------------------------------ cli
 
     def test_unknown_command_is_refused(self):

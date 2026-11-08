@@ -30,9 +30,14 @@ BarWidget {
   readonly property bool gameOn: root.pending !== "" ? root.pending === "on" : !!root.status && root.status.on
   readonly property var items: root.status ? root.status.items : []
   readonly property var mem: root.status ? root.status.mem : null
+  readonly property var gpu: root.status ? root.status.gpu : null
 
   function gb(mb) {
     return Commons.I18n.formatNumber(mb / 1024, 1) + " GB"
+  }
+
+  function size(mb) {
+    return mb < 1024 ? Commons.I18n.formatNumber(mb, 0) + " MB" : root.gb(mb)
   }
 
   function ticked(item) {
@@ -48,21 +53,31 @@ BarWidget {
   readonly property int tickedMB: root.items.reduce(function(sum, i) {
     return sum + (!i.paused && root.ticked(i) ? i.mb : 0)
   }, 0)
+  readonly property int tickedVram: root.items.reduce(function(sum, i) {
+    return sum + (!i.paused && root.ticked(i) ? (i.vram || 0) : 0)
+  }, 0)
   readonly property int tickedCount: root.items.filter(function(i) { return !i.paused && root.ticked(i) }).length
 
-  readonly property string freeLine: root.mem ? root.gb(root.mem.availableMB) + " of " + root.gb(root.mem.totalMB) + " free" : ""
+  readonly property string freeLine: root.mem ? root.gb(root.mem.availableMB) + " of " + root.gb(root.mem.totalMB) + " RAM free" : ""
+  readonly property string vramFreeLine: root.gpu
+    ? root.size(Math.max(0, root.gpu.totalMB - root.gpu.usedMB)) + " of " + root.size(root.gpu.totalMB) + " VRAM free" : ""
 
+  // One line for RAM, one for VRAM (when there's a GPU to read).
   readonly property string stateLine: {
     if (!root.status) return "Reading…"
     if (root.pending === "on") return "Freeing memory…"
     if (root.pending === "off") return "Bringing everything back…"
+    var ram = root.freeLine, vram = root.vramFreeLine
     if (root.gameOn) {
       var since = root.status.since ? new Date(root.status.since * 1000) : null
-      return (since ? "On since " + since.toLocaleTimeString(Qt.locale(Commons.I18n.formatLocale), "HH:mm") + " · " : "")
-        + root.freeLine
+      if (root.status.freedMB) ram += " · freed " + root.gb(root.status.freedMB)
+      if (vram && root.status.freedVramMB) vram += " · freed " + root.size(root.status.freedVramMB)
+      return (since ? "On since " + since.toLocaleTimeString(Qt.locale(Commons.I18n.formatLocale), "HH:mm") + "\n" : "")
+        + ram + (vram ? "\n" + vram : "")
     }
-    if (root.tickedCount === 0) return root.freeLine + " · tick what to pause"
-    return root.freeLine + " · frees about " + root.gb(root.tickedMB)
+    if (root.tickedCount === 0) return ram + (vram ? "\n" + vram : "") + "\nTick what to pause"
+    return ram + " · frees about " + root.gb(root.tickedMB)
+      + (vram ? "\n" + vram + (root.tickedVram > 0 ? " · frees about " + root.size(root.tickedVram) : "") : "")
   }
 
   function rowDescription(item) {
@@ -76,6 +91,7 @@ BarWidget {
     if (!root.status) return "Game mode"
     if (root.working) return root.gameOn ? "Game mode: working…" : "Game mode: bringing everything back…"
     return (root.gameOn ? "Game mode on" : "Game mode off") + "\n" + root.freeLine
+      + (root.vramFreeLine ? "\n" + root.vramFreeLine : "")
       + "\nMiddle-click to turn it " + (root.gameOn ? "off" : "on")
   }
 

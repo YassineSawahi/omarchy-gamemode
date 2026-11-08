@@ -26,14 +26,17 @@ ignored.
 """
 
 import fcntl
+import glob
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
 import sys
 import threading
 import time
+import xml.etree.ElementTree as ET
 
 STATE_NAME = "omarchy-gamemode"
 STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), STATE_NAME)
@@ -279,7 +282,7 @@ def is_game(p):
 
 
 def apps(procs):
-    """name → {pids, argv, mb}: top-level apps of this session (children of the
+    """name → {pids, members, argv, mb}: top-level apps of this session (children of the
     user's service manager or of Hyprland) worth listing and safe to close."""
     children = {}
     for p in procs.values():
@@ -297,8 +300,9 @@ def apps(procs):
         members = [procs[t] for t in tree(p.pid, children) if t in procs]
         if any(m.comm in HOSTS or m.exe in TERMINALS or is_game(m) for m in members):
             continue
-        a = found.setdefault(name, {"pids": [], "argv": p.argv, "mb": 0})
+        a = found.setdefault(name, {"pids": [], "members": [], "argv": p.argv, "mb": 0})
         a["pids"].append(p.pid)
+        a["members"] += [m.pid for m in members]
         a["mb"] += sum(m.kb for m in members) // 1024
     return {k: v for k, v in found.items() if v["mb"] >= MIN_MB}
 
@@ -478,6 +482,130 @@ def start_project(cs):
     return failed
 
 
+# ---------------------------------------------------------------- gpu
+
+# Per-client VRAM keys in DRM fdinfo (amdgpu, xe, i915), most specific first.
+VRAM_KEYS = ("drm-resident-vram0", "drm-memory-vram", "drm-resident-local0", "drm-total-vram0", "drm-total-local0")
+UNITS = {"B": 1 / 1024, "KiB": 1, "MiB": 1024, "GiB": 1024 * 1024}
+
+
+def mib(text):
+    try:
+        return int(str(text).split()[0])
+    except (ValueError, IndexError):
+        return 0
+
+
+def parse_nvidia(xml_text):
+    """(pid → MB, usedMB, totalMB) from `nvidia-smi -q -x`, summed over GPUs."""
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return None
+    pids, used, total = {}, 0, 0
+    for gpu in root.iter("gpu"):
+        fb = gpu.find("fb_memory_usage")
+        if fb is not None:
+            used += mib(fb.findtext("used"))
+            total += mib(fb.findtext("total"))
+        for p in gpu.iter("process_info"):
+            try:
+                pid = int(p.findtext("pid"))
+            except (TypeError, ValueError):
+                continue
+            pids[pid] = pids.get(pid, 0) + mib(p.findtext("used_memory"))
+    return pids, used, total
+
+
+def parse_fdinfo(text):
+    """(client id, KiB of VRAM) from one DRM fdinfo file, or None if it isn't a GPU client."""
+    fields = {}
+    for line in text.splitlines():
+        k, _, v = line.partition(":")
+        fields[k.strip()] = v.split()
+    cid = fields.get("drm-client-id")
+    if not cid:
+        return None
+    for key in VRAM_KEYS:
+        v = fields.get(key)
+        if v:
+            try:
+                return cid[0], int(int(v[0]) * UNITS.get(v[1] if len(v) > 1 else "B", 1 / 1024))
+            except ValueError:
+                return None
+    return cid[0], 0
+
+
+def fdinfo_vram(pid):
+    """MB of VRAM a process holds, from DRM fdinfo; each GPU client counted once."""
+    clients = {}
+    try:
+        fds = os.listdir(f"/proc/{pid}/fdinfo")
+    except OSError:
+        return 0
+    for fd in fds:
+        try:
+            with open(f"/proc/{pid}/fdinfo/{fd}") as f:
+                text = f.read()
+        except OSError:
+            continue
+        if "drm-client-id" in text:
+            got = parse_fdinfo(text)
+            if got:
+                clients[got[0]] = got[1]
+    return sum(clients.values()) // 1024
+
+
+def docker_id(cgroup_text):
+    m = re.search(r"docker-([0-9a-f]{64})\.scope|/docker/([0-9a-f]{64})", cgroup_text)
+    return (m.group(1) or m.group(2)) if m else None
+
+
+class Gpu:
+    """VRAM in use, overall and per process. NVIDIA reports every process, Docker's
+    included; elsewhere only this account's processes can be read, so containers show none."""
+
+    def __init__(self):
+        self.pids, self.used, self.total, self.nvidia = {}, 0, 0, False
+        if shutil.which("nvidia-smi"):
+            r = run("nvidia-smi", "-q", "-x", timeout=10)
+            got = parse_nvidia(r.stdout) if r is not None and r.returncode == 0 else None
+            if got and got[2]:
+                self.pids, self.used, self.total = got
+                self.nvidia = True
+                return
+        for card in glob.glob("/sys/class/drm/card*/device"):
+            try:
+                with open(f"{card}/mem_info_vram_used") as u, open(f"{card}/mem_info_vram_total") as t:
+                    self.used += int(u.read()) // (1024 * 1024)
+                    self.total += int(t.read()) // (1024 * 1024)
+            except (OSError, ValueError):
+                continue
+
+    def of(self, pids):
+        if not self.total:
+            return 0
+        if self.nvidia:
+            return sum(self.pids.get(p, 0) for p in pids)
+        return sum(fdinfo_vram(p) for p in pids)
+
+    def by_container(self):
+        out = {}
+        for pid, mb in self.pids.items():
+            try:
+                with open(f"/proc/{pid}/cgroup") as f:
+                    cid = docker_id(f.read())
+            except OSError:
+                continue
+            if cid:
+                out[cid] = out.get(cid, 0) + mb
+        return out
+
+
+def size(mb):
+    return f"{mb} MB" if mb < 1024 else gb(mb)
+
+
 # ---------------------------------------------------------------- items
 
 def indexer_active():
@@ -489,31 +617,41 @@ def gb(mb):
     return f"{mb / 1024:.1f} GB"
 
 
-def discover():
-    """Everything that could be paused right now, biggest first."""
+def discover(gpu=None):
+    """Everything that could be paused right now, biggest first, with the RAM (plus swap)
+    and VRAM each one holds."""
+    gpu = gpu or Gpu()
     items = []
     for name, a in apps(processes()).items():
         items.append({"key": "app:" + name, "kind": "app", "name": name, "label": LABELS.get(name, name.capitalize()),
-                      "mb": a["mb"], "pids": a["pids"], "argv": a["argv"]})
+                      "mb": a["mb"], "vram": gpu.of(a["members"]), "pids": a["pids"], "argv": a["argv"]})
     projects = {}
     for c in containers():
         projects.setdefault(c["project"], []).append(c)
+    on_gpu = gpu.by_container()
     for project, cs in projects.items():
-        items.append({"key": "docker:" + project, "kind": "docker", "label": project,
-                      "mb": sum(c["mb"] for c in cs), "containers": cs})
-    items.sort(key=lambda i: -i["mb"])
+        items.append({"key": "docker:" + project, "kind": "docker", "label": project, "mb": sum(c["mb"] for c in cs),
+                      "vram": sum(on_gpu.get(c["id"], 0) for c in cs), "containers": cs})
+    items.sort(key=lambda i: -(i["mb"] + i["vram"]))
     if indexer_active():
-        items.append({"key": "indexer", "kind": "indexer", "label": "File indexer", "mb": 0})
+        items.append({"key": "indexer", "kind": "indexer", "label": "File indexer", "mb": 0, "vram": 0})
     return items
+
+
+def holds(item):
+    out = gb(item["mb"]) + " RAM"
+    if item.get("vram"):
+        out += " · " + size(item["vram"]) + " VRAM"
+    return out
 
 
 def describe(item, paused):
     if item["kind"] == "app":
-        return "Closed · reopens when you switch it back" if paused else gb(item["mb"]) + " · asked to quit, reopens after"
+        return "Closed · reopens when you switch it back" if paused else holds(item) + " · quits, reopens after"
     if item["kind"] == "docker":
         n = len(item["containers"])
         what = f"{n} container{'s' if n != 1 else ''}"
-        return what + " stopped" if paused else f"{what} · {gb(item['mb'])}"
+        return what + " stopped" if paused else f"{what} · {holds(item)}"
     return "Paused" if paused else "Stops reading the disk"
 
 
@@ -566,25 +704,30 @@ def resume(record):
 def status():
     state = read_state()
     prefs = read_prefs()
-    out = {"on": bool(state), "busy": busy(), "mem": meminfo(), "items": []}
+    gpu = Gpu()
+    out = {"on": bool(state), "busy": busy(), "mem": meminfo(), "items": [],
+           "gpu": {"usedMB": gpu.used, "totalMB": gpu.total} if gpu.total else None}
     paused_keys = set()
     if state:
-        out.update(since=state.get("since"), freedMB=state.get("freedMB", 0))
+        out.update(since=state.get("since"), freedMB=state.get("freedMB", 0), freedVramMB=state.get("freedVramMB", 0))
         for r in state["items"]:
             paused_keys.add(r["key"])
             out["items"].append({"key": r["key"], "kind": r["kind"], "label": r["label"],
-                                 "detail": describe(r, True), "mb": 0, "paused": True, "selected": True})
-    for i in discover():
+                                 "detail": describe(r, True), "mb": 0, "vram": 0, "paused": True, "selected": True})
+    for i in discover(gpu):
         if i["key"] in paused_keys:
             continue
         out["items"].append({"key": i["key"], "kind": i["kind"], "label": i["label"], "detail": describe(i, False),
-                             "mb": i["mb"], "paused": False, "selected": selected(i["key"], prefs)})
-    out["selectedMB"] = sum(i["mb"] for i in out["items"] if i["selected"] and not i["paused"])
+                             "mb": i["mb"], "vram": i["vram"], "paused": False, "selected": selected(i["key"], prefs)})
+    ticked = [i for i in out["items"] if i["selected"] and not i["paused"]]
+    out["selectedMB"] = sum(i["mb"] for i in ticked)
+    out["selectedVramMB"] = sum(i["vram"] for i in ticked)
     return out
 
 
 def pause_items(items, state):
-    before = meminfo()["availableMB"]
+    """Returns (RAM freed, RAM free now, VRAM freed or None without a GPU, problems)."""
+    before, vbefore = meminfo()["availableMB"], Gpu()
     started = [pause(i) for i in items]
     # Recorded before waiting, so a crash halfway still leaves a way back.
     state["items"] += [record for record, _ in started]
@@ -593,9 +736,11 @@ def pause_items(items, state):
     problems = [p for _, wait in started for p in wait()]
     time.sleep(1)
     after = meminfo()["availableMB"]
+    vfreed = max(0, vbefore.used - Gpu().used) if vbefore.total else None
     state["freedMB"] = state.get("freedMB", 0) + max(0, after - before)
+    state["freedVramMB"] = state.get("freedVramMB", 0) + (vfreed or 0)
     save_state(state)
-    return after - before, after, problems
+    return after - before, after, vfreed, problems
 
 
 def resume_records(records):
@@ -624,9 +769,10 @@ def cmd_on():
     if not items:
         notify("Game mode", "Nothing is ticked, so there's nothing to pause.")
         return
-    state = {"since": int(time.time()), "items": [], "freedMB": 0}
-    freed, after, problems = pause_items(items, state)
-    body = f"Paused {', '.join(i['label'] for i in items)}\nFreed {gb(max(0, freed))} · {gb(after)} free now"
+    state = {"since": int(time.time()), "items": [], "freedMB": 0, "freedVramMB": 0}
+    freed, after, vfreed, problems = pause_items(items, state)
+    body = (f"Paused {', '.join(i['label'] for i in items)}\nFreed {gb(max(0, freed))} RAM"
+            + (f" and {size(vfreed)} VRAM" if vfreed is not None else "") + f" · {gb(after)} RAM free now")
     if problems:
         body += "\n" + "; ".join(problems)
     notify("Game mode on", body, "critical" if problems else "normal")
@@ -652,7 +798,7 @@ def cmd_pause(key):
     items = [i for i in discover() if i["key"] == key]
     if not items:
         return
-    _, _, problems = pause_items(items, state)
+    _, _, _, problems = pause_items(items, state)
     if problems:
         notify("Game mode", "; ".join(problems), "critical")
 
