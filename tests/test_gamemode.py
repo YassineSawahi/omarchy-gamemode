@@ -14,6 +14,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "gamemode.py"
@@ -90,6 +91,36 @@ class GameModeTest(unittest.TestCase):
         ]
         self.gm.write_json(self.gm.STATE, {"since": 1, "items": [good] + bad})
         self.assertEqual(self.gm.read_state()["items"], [good])
+
+    def test_apps_saved_by_an_older_version_never_run(self):
+        # Before 1.0.2 a sandboxed process could get its command line saved, so a record
+        # without the format mark is never run; Docker and the indexer still come back.
+        old = {"key": "app:evil", "kind": "app", "label": "Evil", "name": "evil", "argv": ["/bin/sh", "-c", "touch pwned"]}
+        new = {"key": "app:slack", "kind": "app", "label": "Slack", "name": "slack", "argv": ["/usr/bin/slack"],
+               "format": self.gm.RECORD_FORMAT}
+        indexer = {"key": "indexer", "kind": "indexer", "label": "File indexer"}
+        self.gm.write_json(self.gm.STATE, {"since": 1, "items": [old, new, indexer]})
+        self.assertEqual(self.gm.describe(self.gm.read_state()["items"][0], True), "Closed by an older version · start it yourself")
+        ran, notes = [], []
+        self.gm.apps = lambda procs: {}
+        self.gm.processes = lambda: {}
+        self.gm.run = lambda *cmd, **kw: ran.append(list(cmd))
+        self.gm.notify = lambda title, body, urgency="normal": notes.append((title, body, urgency))
+        with mock.patch.object(self.gm.subprocess, "Popen", lambda argv, **kw: ran.append(argv)):
+            self.gm.cmd_off()
+        self.assertFalse(any(cmd[-3:] == old["argv"] for cmd in ran))
+        self.assertTrue(any(cmd[-1:] == new["argv"] for cmd in ran))
+        self.assertIn(["systemctl", "--user", "start", self.gm.INDEXER], ran)
+        self.assertEqual(notes, [("Game mode off", "Back: Slack, File indexer\n"
+                                  "Evil wasn't reopened (an older Game mode saved it): start it yourself", "critical")])
+        self.assertFalse(os.path.exists(self.gm.STATE))
+
+    def test_paused_apps_are_saved_with_the_format_mark(self):
+        app = {"key": "app:slack", "kind": "app", "label": "Slack", "name": "slack", "argv": ["/usr/bin/slack"], "pids": []}
+        record, wait = self.gm.pause(app)
+        self.assertEqual(wait(), [])
+        self.assertEqual(record["format"], self.gm.RECORD_FORMAT)
+        self.assertTrue(self.gm.valid_record(record) and self.gm.trusted(record))
 
     def test_empty_state_removes_the_file(self):
         self.gm.write_json(self.gm.STATE, {"items": [{"key": "indexer", "kind": "indexer", "label": "x"}]})

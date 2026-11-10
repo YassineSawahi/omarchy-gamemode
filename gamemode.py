@@ -22,7 +22,8 @@ $XDG_RUNTIME_DIR, on purpose: `docker stop` stops even `unless-stopped`
 containers for good, so after a reboot the record is what brings them back.
 That record holds the command lines `off` runs to reopen apps, so the folder is
 kept private (0700) and a file that another account could have written is
-ignored.
+ignored. An app saved by a version before 1.0.2, which could be fooled into
+recording a sandboxed process, is never reopened: you start it yourself.
 """
 
 import fcntl
@@ -57,6 +58,9 @@ DEFAULT_ON = {"app:chrome", "app:chromium", "app:slack", "app:discord", "app:Dis
 DEFAULT_OFF_PROJECTS = set()
 # Flags added when an app is reopened, so it comes back as it was.
 RESTORE_FLAGS = {"chrome": ["--restore-last-session"], "chromium": ["--restore-last-session"]}
+# Marks app records saved since 1.0.2. Older versions trusted a parent by its process name, so
+# a sandboxed process could get its command line saved; an app record without this never runs.
+RECORD_FORMAT = 2
 
 # Never offered.
 SYSTEM = {"Hyprland", "start-hyprland", "Xwayland", "quickshell", "omarchy-launch-shell", "uwsm",
@@ -138,6 +142,11 @@ def valid_record(r):
         return isinstance(cs, list) and all(isinstance(c, dict) and isinstance(c.get("id"), str)
                                             and isinstance(c.get("name"), str) for c in cs)
     return kind == "indexer"
+
+
+def trusted(record):
+    """Whether resuming this record is safe: only app records saved since 1.0.2 run a command line."""
+    return record["kind"] != "app" or record.get("format") == RECORD_FORMAT
 
 
 def read_state():
@@ -360,6 +369,8 @@ def alive(pid):
 
 
 def reopen(item):
+    if not trusted(item):
+        return f"{item['label']} wasn't reopened (an older Game mode saved it): start it yourself"
     if item["name"] in apps(processes()):
         return None
     argv = list(item["argv"])
@@ -685,6 +696,8 @@ def holds(item):
 
 def describe(item, paused):
     if item["kind"] == "app":
+        if paused and not trusted(item):
+            return "Closed by an older version · start it yourself"
         return "Closed · reopens when you switch it back" if paused else holds(item) + " · quits, reopens after"
     if item["kind"] == "docker":
         n = len(item["containers"])
@@ -698,7 +711,7 @@ def pause(item):
     kind = item["kind"]
     record = {k: item[k] for k in ("key", "kind", "label")}
     if kind == "app":
-        record.update(name=item["name"], argv=item["argv"])
+        record.update(name=item["name"], argv=item["argv"], format=RECORD_FORMAT)
         for pid in item["pids"]:
             try:
                 os.kill(pid, signal.SIGTERM)
@@ -823,7 +836,8 @@ def cmd_off():
     problems = resume_records(state["items"])
     os.remove(STATE)
     log("off")
-    body = "Back: " + ", ".join(r["label"] for r in state["items"])
+    back = [r["label"] for r in state["items"] if trusted(r)]
+    body = "Back: " + ", ".join(back) if back else "Nothing to reopen"
     if problems:
         body += "\n" + "; ".join(problems)
     notify("Game mode off", body, "critical" if problems else "normal")
