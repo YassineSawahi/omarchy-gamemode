@@ -63,6 +63,9 @@ SYSTEM = {"Hyprland", "start-hyprland", "Xwayland", "quickshell", "omarchy-launc
           "pipewire", "pipewire-pulse", "wireplumber", "localsearch-3", "systemd", "dbus-broker",
           "dbus-daemon", "xdg-desktop-portal", "xdg-desktop-portal-gtk", "xdg-desktop-portal-hyprland"}
 TERMINALS = {"kitty", "alacritty", "foot", "ghostty", "wezterm-gui", "konsole", "gnome-terminal-server", "xterm"}
+# Sandbox launchers: their command line can't start the app again (Flatpak hands bwrap its arguments
+# through a file descriptor), and the app inside is the sandbox's, not this session's.
+SANDBOXES = {"bwrap", "flatpak", "flatpak-spawn", "snap", "snap-confine", "firejail"}
 HOSTS = {"claude", "codex", "opencode", "aider"}  # a tree with one of these in it is someone's live session
 GAME_WORDS = ("steam", "heroic", "lutris", "wine", "proton", "gamescope", "bottles", "legendary", "umu-run")
 INTERPRETERS = {"bash", "sh", "dash", "zsh", "env"} | {f"python3.{n}" for n in range(8, 20)} | {"python3", "python", "node"}
@@ -221,7 +224,17 @@ def selected(key, prefs):
 # ---------------------------------------------------------------- apps
 
 class Proc:
-    __slots__ = ("pid", "ppid", "comm", "exe", "argv", "kb")
+    # path: the real program, "" when it can't be read. ns: its namespaces, None when they can't be read.
+    __slots__ = ("pid", "ppid", "comm", "exe", "path", "ns", "argv", "kb")
+
+
+def namespaces(pid):
+    """The mount, user and PID namespaces a process lives in, or None when they can't be read.
+    A process sandboxed by Flatpak, Snap, bubblewrap or a browser lives in other ones."""
+    try:
+        return tuple(os.readlink(f"/proc/{pid}/ns/{n}") for n in ("mnt", "user", "pid"))
+    except OSError:
+        return None
 
 
 def processes():
@@ -242,10 +255,12 @@ def processes():
                 p.comm = f.read().strip()
             with open(f"/proc/{d}/cmdline", "rb") as f:
                 p.argv = [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
+            p.ns = namespaces(d)
             try:
-                p.exe = os.path.basename(os.readlink(f"/proc/{d}/exe"))
+                p.path = os.readlink(f"/proc/{d}/exe")
+                p.exe = os.path.basename(p.path)
             except OSError:
-                p.exe = p.comm
+                p.path, p.exe = "", p.comm
             p.kb = 0
             with open(f"/proc/{d}/status") as f:
                 for line in f:
@@ -281,19 +296,42 @@ def is_game(p):
     return any(w in " ".join(p.argv[:2]).lower() for w in GAME_WORDS)
 
 
-def apps(procs):
+def user_manager():
+    """The PID of this account's systemd --user, as the system manager reports it. Its /proc
+    entry can't be read, and any process can name itself systemd, so the name proves nothing."""
+    r = run("systemctl", "show", f"user@{os.getuid()}.service", "-p", "MainPID", "--value", timeout=5)
+    try:
+        return int(r.stdout.strip()) if r is not None and r.returncode == 0 else 0
+    except ValueError:
+        return 0
+
+
+def apps(procs, manager=None, own=None):
     """name → {pids, members, argv, mb}: top-level apps of this session (children of the
-    user's service manager or of Hyprland) worth listing and safe to close."""
+    user's service manager or of Hyprland) worth listing and safe to close.
+
+    An app's command line is run again on restore, outside any sandbox it came from, so only
+    processes in this session's own namespaces count, both as apps and as the Hyprland they
+    hang off; a sandboxed process can call itself anything. The service manager is known by
+    its PID. `manager` and `own` are for tests."""
+    manager = user_manager() if manager is None else manager
+    own = namespaces("self") if own is None else own
+
+    def ours(p):
+        return own is not None and p.ns == own
+
     children = {}
     for p in procs.values():
         children.setdefault(p.ppid, []).append(p.pid)
-    parents = {p.pid for p in procs.values() if p.comm in ("systemd", "Hyprland", "start-hyprland")}
+    parents = {p.pid for p in procs.values() if ours(p) and os.path.basename(p.path) in ("Hyprland", "start-hyprland")}
+    if manager > 0:
+        parents.add(manager)
     found = {}
     for p in procs.values():
-        if p.ppid not in parents or p.pid in parents or not p.argv:
+        if p.ppid not in parents or p.pid in parents or not p.argv or not ours(p):
             continue
         name = app_name(p)
-        if name in SYSTEM or p.exe in SYSTEM or p.exe in TERMINALS:
+        if name in SYSTEM or p.exe in SYSTEM or p.exe in TERMINALS or p.exe in SANDBOXES:
             continue
         if any(a.startswith("--type=") or a.startswith(FOREIGN_ARGS) for a in p.argv):
             continue

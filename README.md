@@ -18,6 +18,7 @@ Apps over 150 MB are listed. Chrome, Chromium, Slack, Discord and the indexer st
 - **Game launchers and games:** Steam, Heroic, Lutris, Bottles, Wine, Proton, gamescope, and any `.exe`.
 - **Browsers started by tools** (`--remote-debugging`, `--headless`, automation flags), such as chrome-devtools-mcp or Playwright.
 - **The desktop itself:** Hyprland, Xwayland, the Omarchy shell, PipeWire, portals, D-Bus, systemd.
+- **Sandboxed apps** (Flatpak, Snap, bubblewrap, firejail). Bringing an app back runs its command line again in your session, so only processes in your session's own namespaces count. A command line from inside a sandbox is never recorded, whatever the process calls itself.
 - **Other accounts' processes.** Only your own are looked at or signalled.
 
 Nothing is ever killed. An app gets SIGTERM, which lets it save and quit; one that ignores it keeps running and you're told. `docker stop` gives each container 20 seconds to shut down cleanly.
